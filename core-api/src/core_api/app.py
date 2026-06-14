@@ -38,6 +38,7 @@ from core_api.mcp_server import get_mcp_app, mcp_lifespan
 from core_api.middleware.ingest_body_size import IngestBodySizeMiddleware
 from core_api.middleware.per_tenant_concurrency import per_tenant_storage_slot
 from core_api.middleware.rate_limit import limiter
+from core_api.middleware.request_observation import RequestObservationMiddleware
 from core_api.middleware.request_timeout import (
     _TIMEOUT_OPT_OUT_PATHS,
     RequestTimeoutMiddleware,
@@ -370,6 +371,25 @@ async def lifespan(app):
             set_audit_queue(audit_queue)
             await audit_queue.start()
 
+        # Capability-usage adoption counters: in-process aggregation
+        # flushed to ``capability_usage`` every
+        # ``capability_usage_flush_interval_seconds``. Disabled →
+        # ``record_usage()`` stays a no-op (the emitters never null-check).
+        capability_usage_agg = None
+        if app_settings.capability_usage_enabled:
+            from core_api.services.capability_usage import (
+                CapabilityUsageAggregator,
+                _default_flush,
+                set_aggregator,
+            )
+
+            capability_usage_agg = CapabilityUsageAggregator(
+                flush_interval_seconds=app_settings.capability_usage_flush_interval_seconds,
+                flush_callable=_default_flush,
+            )
+            set_aggregator(capability_usage_agg)
+            await capability_usage_agg.start()
+
         from core_api.tasks import cancel_all_tasks
 
         # ``register_consumers`` must run before ``bus.start`` — the
@@ -422,6 +442,11 @@ async def lifespan(app):
         shutdown_steps: list = []
         if audit_queue is not None:
             shutdown_steps.append(audit_queue.stop(timeout=5.0))
+        if capability_usage_agg is not None:
+            # Final flush before the storage client closes — same ordering
+            # rationale as the audit queue (the flush writes via the DB
+            # session, which must still be live).
+            shutdown_steps.append(capability_usage_agg.stop(timeout=5.0))
         shutdown_steps.extend(
             [
                 event_bus.stop(),
@@ -530,6 +555,17 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     }
     return JSONResponse(body, status_code=422)
 
+
+# Request observation + capability-usage adoption signal. Registered FIRST so
+# it ends up INNERMOST — directly wrapping the router (only Starlette's pure-ASGI
+# ExceptionMiddleware sits between). This placement is load-bearing: it must read
+# ``scope["route"]`` (the matched route template) on the way back out, and
+# ``SlowAPIMiddleware`` is a ``BaseHTTPMiddleware`` that runs the downstream app
+# in a separate task — a route set inside it does NOT reliably propagate back out
+# to an outer middleware. Sitting inside SlowAPI guarantees the template is
+# readable. Trade-off: it no longer wraps RequestTimeout/SlowAPI, so 504s/429s
+# aren't observed — fine, those requests didn't execute a capability anyway.
+app.add_middleware(RequestObservationMiddleware)
 
 app.add_middleware(SlowAPIMiddleware)
 

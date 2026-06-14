@@ -50,6 +50,7 @@ from core_api.services.agent_service import (
     enforce_fleet_write,
 )
 from core_api.services.audit_service import log_action, log_cross_tenant_read
+from core_api.services.capability_usage import record_usage
 from core_api.services.entity_service import get_entity
 from core_api.services.memory_service import (
     create_memories_bulk,
@@ -429,7 +430,46 @@ async def _mcp_session():
 
 # ── FastMCP instance ──
 
-mcp = FastMCP(
+
+class _InstrumentedFastMCP(FastMCP):
+    """FastMCP that records one capability-usage sample per tool call.
+
+    Overriding ``call_tool`` — the single dispatch point every
+    ``tools/call`` routes through (FastMCP wires it as the low-level
+    server's tool handler) — captures the tool name and call arguments
+    without touching any handler's signature, so the generated input
+    schemas are unchanged. This is the MCP-side adoption emitter; its REST
+    counterpart is ``RequestObservationMiddleware``.
+
+    ``op`` for multiplexed tools (``memclaw_manage`` / ``memclaw_doc``)
+    comes straight from the call arguments. ``status`` is derived from
+    raised exceptions only — business-logic error envelopes (returned as
+    ``CallToolResult(isError=True)``) still count as usage, which is the
+    right semantics for adoption (the capability was invoked).
+    """
+
+    async def call_tool(self, name, arguments):  # type: ignore[override]
+        t0 = time.perf_counter()
+        status = "ok"
+        try:
+            return await super().call_tool(name, arguments)
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            op = arguments.get("op") if isinstance(arguments, dict) else None
+            capability = name.removeprefix("memclaw_") if isinstance(name, str) else str(name)
+            record_usage(
+                capability=capability,
+                op=op if isinstance(op, str) else None,
+                transport="mcp",
+                tenant_id=_get_tenant(),
+                status=status,
+                duration_ms=(time.perf_counter() - t0) * 1000.0,
+            )
+
+
+mcp = _InstrumentedFastMCP(
     name=f"MemClaw v{VERSION}",
     instructions=(
         "MemClaw is a persistent memory platform for AI agents. "
