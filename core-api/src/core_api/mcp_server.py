@@ -719,6 +719,8 @@ async def memclaw_recall(
         payload: dict = {
             "results": [r.model_dump(mode="json") for r in results] if results else [],
         }
+        if top_k > MAX_SEARCH_TOP_K:
+            payload["warning"] = f"top_k was capped at the maximum allowed value of {MAX_SEARCH_TOP_K}."
         if include_brief:
             payload["brief"] = await summarize_memories(
                 results,
