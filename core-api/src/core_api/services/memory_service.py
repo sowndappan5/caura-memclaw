@@ -1784,14 +1784,22 @@ async def _schedule_enrich_or_inline(
         # delta between the gates today.
         await _enrich_memory_background(memory_id, content, tenant_id, fleet_id, agent_id)
     else:
-        await publish_memory_enrich_request(
-            memory_id=memory_id,
-            content=content,
-            tenant_id=tenant_id,
-            tenant_config=tenant_config,
-            reference_datetime=reference_datetime,
-            agent_provided_fields=agent_provided_fields,
-        )
+        try:
+            await publish_memory_enrich_request(
+                memory_id=memory_id,
+                content=content,
+                tenant_id=tenant_id,
+                tenant_config=tenant_config,
+                reference_datetime=reference_datetime,
+                agent_provided_fields=agent_provided_fields,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to publish enrichment request for memory %s (deferred mode). Falling back to inline enrichment: %s",
+                memory_id,
+                e,
+            )
+            await _enrich_memory_background(memory_id, content, tenant_id, fleet_id, agent_id)
 
 
 async def _reembed_memory(
