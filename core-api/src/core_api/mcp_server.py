@@ -576,7 +576,7 @@ async def memclaw_recall(
     fleet_ids: Annotated[list[str] | None, Field(description="Restrict fleets.")] = None,
     include_brief: Annotated[bool, Field(description="Add LLM summary.")] = False,
     top_k: Annotated[
-        int, Field(description="Max results, default 5. Values above 20 are capped to 20.")
+        int, Field(description="The number of memories to return (default 5, maximum 20).")
     ] = DEFAULT_SEARCH_TOP_K,
 ) -> str:
     """Hybrid semantic+keyword recall, with optional LLM brief."""
@@ -686,6 +686,8 @@ async def memclaw_recall(
         payload: dict = {
             "results": [r.model_dump(mode="json") for r in results] if results else [],
         }
+        if top_k > MAX_SEARCH_TOP_K:
+            payload["warning"] = f"top_k was capped at the maximum allowed value of {MAX_SEARCH_TOP_K}."
         if include_brief:
             payload["brief"] = await summarize_memories(
                 results,

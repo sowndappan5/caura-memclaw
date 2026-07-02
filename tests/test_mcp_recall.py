@@ -105,16 +105,23 @@ async def test_recall_invalid_status_returns_422(mcp_env):
 
 
 async def test_recall_top_k_is_capped(mcp_env, monkeypatch):
-    """Passing top_k > MAX_SEARCH_TOP_K passes the cap to the service, not the raw value."""
+    """Passing top_k > MAX_SEARCH_TOP_K passes the cap to the service and adds a warning."""
     from core_api.constants import MAX_SEARCH_TOP_K
 
     search_mock = mcp_env["service"]("search_memories")
     search_mock.return_value = []
     _wire_recall_deps(monkeypatch)
 
-    await mcp_server.memclaw_recall(query="x", top_k=1000)
+    out = await mcp_server.memclaw_recall(query="x", top_k=1000)
     kwargs = search_mock.await_args.kwargs
     assert kwargs["top_k"] == MAX_SEARCH_TOP_K
+
+    payload = parse_envelope(out)
+    assert "warning" in payload
+    assert (
+        f"capped at the maximum allowed value of {MAX_SEARCH_TOP_K}"
+        in payload["warning"]
+    )
 
 
 async def test_recall_http_exception_becomes_error_envelope(mcp_env, monkeypatch):
