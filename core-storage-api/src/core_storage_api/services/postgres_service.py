@@ -58,6 +58,7 @@ from common.constants import (
 from common.events.lifecycle_purge_request import MEMORY_RETENTION_MAX_DAYS
 from common.models import (
     Agent,
+    AgentActivityDigest,
     AuditChainHead,
     AuditLog,
     BackgroundTaskLog,
@@ -8246,6 +8247,57 @@ class PostgresService:
                 .limit(1)
             )
             return result.scalar_one_or_none()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  AGENT ACTIVITY DIGEST (AgentActivityDigest) — cached per-agent summaries
+    # ══════════════════════════════════════════════════════════════════════
+
+    async def agent_activity_digest_get_latest(
+        self,
+        tenant_id: str,
+        period: str,
+        *,
+        agent_id: str | None = None,
+        as_of: datetime | None = None,
+    ) -> list[AgentActivityDigest]:
+        """Return every agent row from the most recent run for a tenant/period.
+
+        A "run" is identified by ``run_id``; all its rows share one
+        ``window_start``. We pick the latest run (``window_start`` at or before
+        ``as_of`` when given — for viewing past snapshots) and return its rows.
+        ``agent_id`` narrows to a single agent. Returns ``[]`` when no run
+        exists yet — the caller renders "not generated yet", never an error.
+        """
+        async with get_session() as session:
+            # Resolve the latest run_id for this tenant/period. Keying the row
+            # fetch on run_id (not window_start) keeps the result to a single
+            # coherent run: a same-window re-run mints a new run_id, and the
+            # generated_at tie-break makes the newest such run win.
+            run_stmt = select(AgentActivityDigest.run_id).where(
+                AgentActivityDigest.tenant_id == tenant_id,
+                AgentActivityDigest.period == period,
+            )
+            if as_of is not None:
+                run_stmt = run_stmt.where(AgentActivityDigest.window_start <= as_of)
+            run_stmt = run_stmt.order_by(
+                AgentActivityDigest.window_start.desc(),
+                AgentActivityDigest.generated_at.desc(),
+            ).limit(1)
+            latest_run_id = (await session.execute(run_stmt)).scalar_one_or_none()
+            if latest_run_id is None:
+                return []
+
+            # Scope to tenant_id as well: a fleet-wide pass shares one run_id
+            # across tenants, so run_id alone would return other tenants' rows.
+            rows_stmt = select(AgentActivityDigest).where(
+                AgentActivityDigest.run_id == latest_run_id,
+                AgentActivityDigest.tenant_id == tenant_id,
+            )
+            if agent_id is not None:
+                rows_stmt = rows_stmt.where(AgentActivityDigest.agent_id == agent_id)
+            rows_stmt = rows_stmt.order_by(AgentActivityDigest.source_count.desc())
+            result = await session.execute(rows_stmt)
+            return list(result.scalars().all())
 
     # ══════════════════════════════════════════════════════════════════════
     #  TASKS (BackgroundTaskLog)
