@@ -2408,6 +2408,13 @@ class CoreStorageClient:
             raise RuntimeError("core-storage-api /tenants/skills-factory-enabled returned 404")
         return result.get("org_ids", [])
 
+    async def list_agent_digest_enabled_orgs(self) -> list[str]:
+        """Orgs whose ``agent_digest.enabled`` setting is True."""
+        result = await self._get("/tenants/agent-digest-enabled")
+        if result is None:
+            raise RuntimeError("core-storage-api /tenants/agent-digest-enabled returned 404")
+        return result.get("org_ids", [])
+
     # =====================================================================
     # Reports
     # =====================================================================
@@ -2465,6 +2472,17 @@ class CoreStorageClient:
         if as_of is not None:
             params["as_of"] = as_of
         return await self._get_list("/reports/agent-activity", **params)
+
+    async def upsert_agent_activity_digest(self, data: dict) -> dict:
+        """Insert/replace one agent-activity digest row (digest generator writes)."""
+        return await self._post("/reports/agent-activity", data)  # type: ignore[return-value]
+
+    async def prune_agent_activity_digests(self, tenant_id: str, older_than: str) -> int:
+        """Delete a tenant's digest rows older than ``older_than`` (ISO); count."""
+        result = await self._post(
+            "/reports/agent-activity/prune", {"tenant_id": tenant_id, "older_than": older_than}
+        )
+        return result.get("deleted", 0) if isinstance(result, dict) else 0
 
     # =====================================================================
     # Tasks

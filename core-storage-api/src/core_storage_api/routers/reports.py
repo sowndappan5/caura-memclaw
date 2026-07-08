@@ -84,6 +84,49 @@ async def get_agent_activity_digest(
     return [orm_to_dict(r, AGENT_DIGEST_FIELDS) for r in rows]
 
 
+@router.post("/agent-activity")
+async def upsert_agent_activity_digest(request: Request) -> dict:
+    """Insert or replace one agent-activity digest row (internal; written by the
+    digest generator in core-api). Idempotent on the run window — see
+    ``agent_activity_digest_upsert``. Body is the full row; ISO datetime strings
+    are parsed to datetimes.
+    """
+    body: dict = await request.json()
+    for field in ("tenant_id", "run_id", "agent_id", "period", "window_start", "window_end", "status"):
+        if not body.get(field):
+            raise HTTPException(status_code=422, detail=f"'{field}' is required")
+    if body["period"] not in ("day", "week"):
+        raise HTTPException(status_code=422, detail="'period' must be 'day' or 'week'")
+    for k in ("window_start", "window_end", "generated_at"):
+        v = body.get(k)
+        if isinstance(v, str):
+            try:
+                body[k] = datetime.fromisoformat(v)
+            except ValueError:
+                raise HTTPException(status_code=422, detail=f"'{k}' must be a valid ISO datetime")
+    row = await _svc.agent_activity_digest_upsert(body)
+    return orm_to_dict(row, AGENT_DIGEST_FIELDS)
+
+
+@router.post("/agent-activity/prune")
+async def prune_agent_activity_digests(request: Request) -> dict:
+    """Delete a tenant's digest rows older than ``older_than`` (retention sweep;
+    internal). Body: ``{tenant_id, older_than (ISO)}``. Returns ``{deleted}``."""
+    body: dict = await request.json()
+    tenant_id = body.get("tenant_id")
+    older_than = body.get("older_than")
+    if not tenant_id:
+        raise HTTPException(status_code=422, detail="'tenant_id' is required")
+    if not older_than:
+        raise HTTPException(status_code=422, detail="'older_than' is required")
+    if isinstance(older_than, str):
+        try:
+            older_than = datetime.fromisoformat(older_than)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="'older_than' must be a valid ISO datetime")
+    return {"deleted": await _svc.agent_activity_digest_prune(tenant_id, older_than)}
+
+
 @router.get("/{report_id}")
 async def get_report(report_id: UUID) -> dict:
     report = await _svc.report_get_by_id(report_id)

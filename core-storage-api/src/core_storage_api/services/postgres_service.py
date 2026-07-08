@@ -8150,6 +8150,18 @@ class PostgresService:
             )
             return sorted(row[0] for row in result.all())
 
+    async def tenants_list_agent_digest_enabled(self) -> list[str]:
+        """``org_id`` values whose ``agent_digest.enabled`` JSONB flag is True,
+        sorted. The nightly digest fanout uses this so a tenant that hasn't opted
+        in pays zero cost. Orgs with no settings row are excluded (default off)."""
+        async with get_read_session() as session:
+            result = await session.execute(
+                select(OrganizationSettings.org_id).where(
+                    OrganizationSettings.settings["agent_digest"]["enabled"].as_boolean().is_(True)
+                )
+            )
+            return sorted(row[0] for row in result.all())
+
     # ══════════════════════════════════════════════════════════════════════
     #  REPORTS (CrystallizationReport)
     # ══════════════════════════════════════════════════════════════════════
@@ -8298,6 +8310,72 @@ class PostgresService:
             rows_stmt = rows_stmt.order_by(AgentActivityDigest.source_count.desc())
             result = await session.execute(rows_stmt)
             return list(result.scalars().all())
+
+    async def agent_activity_digest_upsert(self, data: dict) -> AgentActivityDigest:
+        """Insert or replace one digest row; idempotent on the run window.
+
+        Re-running the same (tenant_id, [fleet_id], agent_id, period,
+        window_start) overwrites the prior content — a re-run mints a fresh
+        ``run_id`` and refreshes ``generated_at``. Uniqueness is enforced by two
+        PARTIAL unique indexes (fleet / no-fleet), and ``ON CONFLICT`` can infer
+        only one, so we target the index matching this row's fleet_id NULL-ness.
+        """
+        async with get_session() as session:
+            insert_stmt = pg_insert(AgentActivityDigest).values(**data)
+            set_ = {
+                "run_id": insert_stmt.excluded.run_id,
+                "window_end": insert_stmt.excluded.window_end,
+                "narrative": insert_stmt.excluded.narrative,
+                "sections": insert_stmt.excluded.sections,
+                "source_count": insert_stmt.excluded.source_count,
+                "recall_count": insert_stmt.excluded.recall_count,
+                "model": insert_stmt.excluded.model,
+                "status": insert_stmt.excluded.status,
+                "error_detail": insert_stmt.excluded.error_detail,
+                # A re-run's row is freshly generated — stamp update time.
+                "generated_at": func.now(),
+            }
+            if data.get("fleet_id") is None:
+                upsert_stmt = insert_stmt.on_conflict_do_update(
+                    index_elements=["tenant_id", "agent_id", "period", "window_start"],
+                    index_where=text("fleet_id IS NULL"),
+                    set_=set_,
+                )
+            else:
+                upsert_stmt = insert_stmt.on_conflict_do_update(
+                    index_elements=["tenant_id", "fleet_id", "agent_id", "period", "window_start"],
+                    index_where=text("fleet_id IS NOT NULL"),
+                    set_=set_,
+                )
+            await session.execute(upsert_stmt)
+
+            # Re-fetch for a tracked ORM instance: RETURNING on a
+            # pg_insert+on_conflict yields a Row, not the ORM object orm_to_dict
+            # expects (mirrors relation_upsert). The natural key + fleet_id
+            # NULL-ness pins exactly one row.
+            select_stmt = select(AgentActivityDigest).where(
+                AgentActivityDigest.tenant_id == data["tenant_id"],
+                AgentActivityDigest.agent_id == data["agent_id"],
+                AgentActivityDigest.period == data["period"],
+                AgentActivityDigest.window_start == data["window_start"],
+            )
+            if data.get("fleet_id") is None:
+                select_stmt = select_stmt.where(AgentActivityDigest.fleet_id.is_(None))
+            else:
+                select_stmt = select_stmt.where(AgentActivityDigest.fleet_id == data["fleet_id"])
+            return (await session.execute(select_stmt)).scalar_one()
+
+    async def agent_activity_digest_prune(self, tenant_id: str, older_than: datetime) -> int:
+        """Delete this tenant's digest rows generated before ``older_than``
+        (retention sweep). Returns the number of rows deleted."""
+        async with get_session() as session:
+            result = await session.execute(
+                delete(AgentActivityDigest).where(
+                    AgentActivityDigest.tenant_id == tenant_id,
+                    AgentActivityDigest.generated_at < older_than,
+                )
+            )
+            return result.rowcount or 0  # type: ignore[attr-defined]
 
     # ══════════════════════════════════════════════════════════════════════
     #  TASKS (BackgroundTaskLog)
